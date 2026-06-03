@@ -1,0 +1,15 @@
+# Echo Voice Loop 依赖
+# 安装: pip install -r requirements.txt
+
+# 核心语音链路
+openai-whisper>=20240930
+edge-tts>=6.1.0
+pyaudio>=0.2.14
+numpy>=1.24.0
+requests>=2.31.0
+
+# 树莓派额外系统依赖:
+# sudo apt install mpg123 portaudio19-dev
+#
+# macOS 额外系统依赖:
+# brew install portaudio
