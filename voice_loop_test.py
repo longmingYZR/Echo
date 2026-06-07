@@ -30,19 +30,40 @@ def print_banner():
 
 
 def test_llm():
-    """仅测试 LLM：发送文字 → 打印回复（不播放语音）。"""
+    """仅测试 LLM：发送文字 → 打印回复（不播放语音）。含策略引擎。"""
     api_key = CONFIG["llm_api_key"]
     if not api_key:
         print("[错误] 请先设置 DEEPSEEK_API_KEY 环境变量")
         print("  export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx")
         return
 
-    print("\n── LLM 连通性测试 ──")
+    print("\n── LLM 连通性测试（含策略引擎）──")
     print(f"API: {CONFIG['llm_api_url']}")
     print(f"模型: {CONFIG['llm_model']}")
 
     llm = LLMClient()
-    system_prompt = EchoVoiceLoop.DEFAULT_SYSTEM_PROMPT
+
+    # 初始化感知与策略模块
+    try:
+        from core.gap_detector import GapDetector
+        from core.strategy_engine import StrategyEngine
+        from core.memory_awakener import MemoryAwakener
+        gap_detector = GapDetector(llm_chat_fn=llm.chat_stateless)
+        strategy_engine = StrategyEngine(gap_detector)
+        has_strategy = True
+        time_ctx = MemoryAwakener.time_since_last()
+        print(f"  记忆上下文: 已加载 ({time_ctx})")
+    except Exception:
+        has_strategy = False
+
+    # 构建基础 system prompt
+    try:
+        ctx = MemoryAwakener.build_context()
+        base_prompt = EchoVoiceLoop.ECHO_BASE_PROMPT.format(
+            memory_context=ctx.get("full_context", "")
+        )
+    except Exception:
+        base_prompt = EchoVoiceLoop.DEFAULT_SYSTEM_PROMPT
 
     print("\n输入文字提问（输入 q 退出）：")
     while True:
@@ -55,9 +76,22 @@ def test_llm():
         if text.lower() == 'q':
             break
 
+        # 策略引擎决策（每轮动态）
+        mode_block = ""
+        if has_strategy:
+            try:
+                strategy = strategy_engine.decide(text)
+                mode_block = f"\n\n{strategy['mode_prompt']}"
+                gap = strategy['gap_result']
+                if gap['gap_detected']:
+                    print(f"  🔍 缝隙: {gap['gap_size']:.1f} | 模式: {strategy['mode']}"
+                          f"{' (LLM)' if gap.get('analysis_used_llm') else ''}")
+            except Exception:
+                pass
+
         print("⏳ 思考中...", end='', flush=True)
         try:
-            reply = llm.chat(text, system_prompt)
+            reply = llm.chat(text, base_prompt + mode_block)
             print(f"\r🤖 Echo: {reply}")
         except Exception as e:
             print(f"\r[错误] {e}")
@@ -106,20 +140,55 @@ def test_tts():
 
 
 def test_full_text_mode():
-    """完整文字模式：键盘输入 → LLM → TTS 播放。"""
+    """完整文字模式：键盘输入 → LLM → TTS 播放。含记忆系统。"""
     api_key = CONFIG["llm_api_key"]
     if not api_key:
         print("[错误] 请先设置 DEEPSEEK_API_KEY 环境变量")
         print("  export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx")
         return
 
-    print("\n── 完整文字模式 ──")
+    print("\n── 完整文字模式（含记忆系统）──")
     print("键盘输入 → DeepSeek LLM → 语音播放")
+    print("每轮对话自动写入记忆数据库")
     print("输入 q 退出\n")
 
     llm = LLMClient()
     tts = EdgeTTS()
-    system_prompt = EchoVoiceLoop.DEFAULT_SYSTEM_PROMPT
+
+    # 初始化记忆 + 感知 + 策略系统
+    try:
+        from core.memory_awakener import MemoryAwakener
+        from core.memory_writer import MemoryWriter
+        from core.memory_refiner import MemoryRefiner
+        from core.gap_detector import GapDetector
+        from core.strategy_engine import StrategyEngine
+        import uuid
+
+        session_id = uuid.uuid4().hex[:8]
+        memory_writer = MemoryWriter(llm_chat_fn=llm.chat_stateless)
+        memory_refiner = MemoryRefiner(llm_chat_fn=llm.chat_stateless)
+        gap_detector = GapDetector(llm_chat_fn=llm.chat_stateless)
+        strategy_engine = StrategyEngine(gap_detector)
+        dialogue_buffer: list[str] = []
+
+        time_ctx = MemoryAwakener.time_since_last()
+        print(f"  {time_ctx}")
+        has_full_system = True
+    except Exception as e:
+        print(f"  ⚠ 完整系统不可用: {e}")
+        has_full_system = False
+
+    # 构建基础 system prompt（不含模式，模式每轮动态追加）
+    if has_full_system:
+        try:
+            ctx = MemoryAwakener.build_context()
+            base_prompt = EchoVoiceLoop.ECHO_BASE_PROMPT.format(
+                memory_context=ctx.get("full_context", "")
+            )
+        except Exception:
+            base_prompt = EchoVoiceLoop.DEFAULT_SYSTEM_PROMPT
+    else:
+        base_prompt = EchoVoiceLoop.DEFAULT_SYSTEM_PROMPT
 
     while True:
         try:
@@ -131,13 +200,55 @@ def test_full_text_mode():
         if text.lower() == 'q':
             break
 
+        # 每轮策略决策
+        mode_block = ""
+        if has_full_system:
+            try:
+                strategy = strategy_engine.decide(text)
+                mode_block = f"\n\n{strategy['mode_prompt']}"
+                gap = strategy['gap_result']
+                if gap['gap_detected']:
+                    print(f"  🔍 缝隙: {gap['gap_size']:.1f} | 模式: {strategy['mode']}"
+                          f"{' (LLM)' if gap.get('analysis_used_llm') else ''}")
+            except Exception:
+                pass
+
         print("⏳ 思考中...", end='', flush=True)
         try:
-            reply = llm.chat(text, system_prompt)
+            reply = llm.chat(text, base_prompt + mode_block)
             print(f"\r🤖 Echo: {reply}")
         except Exception as e:
             print(f"\r[错误] LLM: {e}")
             continue
+
+        # 写入记忆
+        if has_memory:
+            dialogue_buffer.append(f"用户: {text}")
+            dialogue_buffer.append(f"Echo: {reply}")
+            try:
+                result = memory_writer.write(list(dialogue_buffer), session_id=session_id)
+                if result.get("events_written"):
+                    print(f"  📝 记忆已更新", end='')
+                if result.get("moment_created"):
+                    print(f" | 💎 重要时刻已记录", end='')
+                print()
+                if len(dialogue_buffer) > 20:
+                    dialogue_buffer = dialogue_buffer[-20:]
+            except Exception as e:
+                print(f"  ⚠ 记忆写入失败: {e}")
+
+        # 定期提炼
+        if has_memory:
+            try:
+                if memory_refiner.should_refine():
+                    print("  🔄 触发记忆深度提炼...", end='', flush=True)
+                    result = memory_refiner.refine()
+                    if result.get("refined"):
+                        print(f"\r  记忆深度提炼完成 ({', '.join(result.get('model_layers_updated', []))})        ")
+                    else:
+                        print(f"\r  提炼跳过: {result.get('reason', '')}                    ")
+            except Exception as e:
+                print(f"\n  ⚠ 记忆提炼失败: {e}")
 
         print("🔊 播放中...", end='', flush=True)
         try:

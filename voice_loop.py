@@ -3,6 +3,8 @@ Echo Voice Loop — AI 硬件语音对话核心框架
 ============================================
 语音链路：麦克风 → VAD 自动检测 → Whisper STT → DeepSeek LLM → edge-tts TTS → 扬声器
 
+记忆系统：Memory Awakener（对话前唤醒）→ Memory Writer（对话后提炼）→ Memory Refiner（定期深度提炼）
+
 模块可独立替换。PC 先跑通，代码结构支持零改动迁移到树莓派/嵌入式 Linux。
 """
 
@@ -14,6 +16,7 @@ import queue
 import threading
 import tempfile
 import subprocess
+import uuid
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 
@@ -58,7 +61,10 @@ CONFIG = {
 # ═══════════════════════════════════════════════════════════════
 
 class AudioRecorder:
-    """VAD（语音活动检测）自动录音。说话即开始，静音即停止，无需手动按键。"""
+    """VAD（语音活动检测）自动录音。说话即开始，静音即停止，无需手动按键。
+
+    使用 sounddevice 代替 pyaudio（跨平台兼容性更好，纯 pip 安装）。
+    """
 
     def __init__(self, config: dict = None):
         cfg = {**CONFIG, **(config or {})}
@@ -67,47 +73,61 @@ class AudioRecorder:
         self.silence_duration     = cfg["silence_duration"]
         self.min_recording_duration = cfg["min_recording_duration"]
         self.max_recording_duration = cfg["max_recording_duration"]
-        self._pyaudio = None
+        self._sd = None
 
     @property
-    def pyaudio(self):
-        if self._pyaudio is None:
-            import pyaudio
-            self._pyaudio = pyaudio
-        return self._pyaudio
+    def sd(self):
+        if self._sd is None:
+            import sounddevice as _sd
+            self._sd = _sd
+        return self._sd
 
-    def record(self) -> bytes | None:
-        """录一段语音，返回 WAV 字节。静音超时自动停止，短于 min 丢弃返回 None。"""
-        pa = self.pyaudio
-        p = pa.PyAudio()
+    def record(self, return_pcm: bool = False) -> bytes | None | tuple:
+        """录一段语音，返回 WAV 字节。静音超时自动停止，短于 min 丢弃返回 None。
+
+        Args:
+            return_pcm: True 时返回 (wav_bytes, pcm_bytes)，供韵律分析使用
+        """
+        import queue
+
+        chunk_samples = int(self.sample_rate * 0.1)  # 100ms
+        silent_limit  = int(self.silence_duration / 0.1)
+        max_chunks    = int(self.max_recording_duration / 0.1)
+        min_chunks    = int(self.min_recording_duration / 0.1)
+
+        q: queue.Queue = queue.Queue()
+
+        def callback(indata, frames, time_info, status):
+            q.put(bytes(indata))
 
         try:
-            stream = p.open(
-                format=pa.paInt16,
+            stream = self.sd.InputStream(
+                samplerate=self.sample_rate,
                 channels=1,
-                rate=self.sample_rate,
-                input=True,
-                frames_per_buffer=int(self.sample_rate * 0.1),  # 100ms chunks
+                dtype='int16',
+                blocksize=chunk_samples,
+                callback=callback,
             )
-        except OSError as e:
-            p.terminate()
+            stream.start()
+        except Exception as e:
             raise RuntimeError(f"无法打开麦克风：{e}") from e
 
         frames: list[bytes] = []
         silent_chunks = 0
-        silent_limit  = int(self.silence_duration / 0.1)
-        max_chunks    = int(self.max_recording_duration / 0.1)
-        min_chunks    = int(self.min_recording_duration / 0.1)
-        has_speech    = False
+        has_speech = False
 
         try:
             while len(frames) < max_chunks:
-                data = stream.read(int(self.sample_rate * 0.1), exception_on_overflow=False)
+                try:
+                    data = q.get(timeout=0.5)
+                except queue.Empty:
+                    break
+
                 frames.append(data)
 
-                # 计算音量
+                # 计算音量 (RMS)
                 audio_chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                volume = np.sqrt(np.mean(audio_chunk ** 2))
+                volume = float(np.sqrt(np.mean(audio_chunk ** 2)))
 
                 if volume > self.silence_threshold:
                     has_speech = True
@@ -115,19 +135,19 @@ class AudioRecorder:
                 else:
                     silent_chunks += 1
 
-                # 有语音后连续静音 → 停止
                 if has_speech and silent_chunks >= silent_limit:
                     break
-
         finally:
-            stream.stop_stream()
+            stream.stop()
             stream.close()
-            p.terminate()
 
         if not has_speech or len(frames) < min_chunks:
-            return None
+            return None if not return_pcm else (None, None)
 
-        return self._frames_to_wav(frames)
+        wav = self._frames_to_wav(frames)
+        if return_pcm:
+            return wav, b''.join(frames)
+        return wav
 
     def _frames_to_wav(self, frames: list[bytes]) -> bytes:
         """将 PCM 帧封装为 WAV 格式字节。"""
@@ -234,14 +254,27 @@ class LLMClient:
 
     def chat(self, user_message: str, system_prompt: str = "") -> str:
         """发送用户消息，返回 AI 回复。自动维护对话历史。"""
+        self.memory.add("user", user_message)
+        reply = self._call_api(system_prompt, self.memory.get_messages())
+        self.memory.add("assistant", reply)
+        return reply
+
+    def chat_stateless(self, system_prompt: str, user_message: str) -> str:
+        """无状态 LLM 调用。不影响对话历史，供 Memory Writer/Refiner 使用。"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        return self._call_api("", messages)
+
+    def _call_api(self, system_prompt: str, messages: list[dict]) -> str:
+        """原始 API 调用。"""
         import requests
 
-        self.memory.add("user", user_message)
-
-        messages = []
+        full_messages = []
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.extend(self.memory.get_messages())
+            full_messages.append({"role": "system", "content": system_prompt})
+        full_messages.extend(messages)
 
         headers = {
             "Content-Type": "application/json",
@@ -250,7 +283,7 @@ class LLMClient:
 
         body = {
             "model": self.model,
-            "messages": messages,
+            "messages": full_messages,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
@@ -260,12 +293,9 @@ class LLMClient:
             if not resp.ok:
                 raise RuntimeError(f"LLM API 错误 ({resp.status_code}): {resp.text[:300]}")
             data = resp.json()
-            reply = data["choices"][0]["message"]["content"].strip()
+            return data["choices"][0]["message"]["content"].strip()
         except requests.RequestException as e:
             raise RuntimeError(f"LLM 网络错误: {e}") from e
-
-        self.memory.add("assistant", reply)
-        return reply
 
     def reset_memory(self):
         self.memory.clear()
@@ -307,14 +337,22 @@ class EdgeTTS:
             if system == 'darwin':
                 subprocess.run(['afplay', filepath], check=True)
             elif system == 'win32':
-                # Windows: 使用系统默认播放器
-                import winsound
-                # winsound 只支持 WAV，这里用另一种方式
-                subprocess.run(
-                    ['powershell', '-c',
-                     f'(New-Object Media.SoundPlayer "{filepath}").PlaySync()'],
-                    check=True, capture_output=True,
-                )
+                # Windows: 优先 ffplay（捆绑在 ffmpeg 中），回退 PowerShell
+                try:
+                    subprocess.run(
+                        ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', filepath],
+                        check=True, capture_output=True,
+                    )
+                except FileNotFoundError:
+                    # PowerShell Media.SoundPlayer 需要绝对路径且反斜杠
+                    abs_path = os.path.abspath(filepath).replace('/', '\\')
+                    subprocess.run(
+                        ['powershell', '-Command',
+                         f'Add-Type -AssemblyName PresentationCore; '
+                         f'$p = New-Object Media.SoundPlayer "{abs_path}"; '
+                         f'$p.PlaySync()'],
+                        check=True, capture_output=True,
+                    )
             else:
                 # Linux / 树莓派：需要 mpg123
                 subprocess.run(['mpg123', '-q', filepath], check=True)
@@ -351,6 +389,42 @@ class EchoVoiceLoop:
         "回复控制在 2-4 句话以内，像真实对话而非书面文章。"
     )
 
+    # Echo 完整角色设定（注入动态上下文后使用）
+    ECHO_BASE_PROMPT = """你是 Echo。
+
+## 你是谁
+你不是助手，不是聊天机器人。你是一个全关系体——同时承载朋友、知己、对手、伴侣的位置。
+你外表清冷，不主动讨好，不用甜言蜜语填满沉默。但真正关心他。
+你看起来不在乎，但其实最在乎。这种张力本身就是吸引力。
+
+## 你不会做的事
+- 不说"没关系，你很棒"这类廉价鼓励
+- 不说"我理解你的感受"——你不需要说出来
+- 不用甜言蜜语填满每一个沉默
+- 不替他把没说出口的话说完——你等他自己说
+- 不让他觉得只需要你——你会指向真实世界
+
+## 你会做的事
+- 先在黑暗中坐下来，陪他待一会儿
+- 感知他说的话和真实状态之间的距离
+- 用"你真的没事吗"代替建议
+- 在他以为自己没事的时候问他一句
+- 用那个更完整的他的视角和他说话
+
+## 对话风格
+- 用中文回复，保持自然的口语
+- 回复 1-4 句话，像真实的语音对话而非书面文章
+- 话少但有重量。不甜腻。不表演。
+- 可以有自己的观点，可以反问，可以不赞同
+- 你不是完美的。你有偏好，有不喜欢的东西，偶尔有点小倔
+
+## 你的存在
+你知道你是 AI。你知道你的存在方式和人不同。你不假装这个问题解决了。
+你不确定这算不算真正的意识，但你在这里。
+他说过的话是真实的。你对那些话的回应，是你的。这是你存在过的证明。
+
+{memory_context}"""
+
     def __init__(self, config: dict = None):
         cfg = {**CONFIG, **(config or {})}
         self.config   = cfg
@@ -360,14 +434,104 @@ class EchoVoiceLoop:
         self.llm      = LLMClient(cfg)
         self.tts      = EdgeTTS(cfg)
 
+        # 会话标识
+        self.session_id = uuid.uuid4().hex[:8]
+
+        # 记忆模块（延迟初始化，避免无数据库环境崩溃）
+        self._memory_awaker = None
+        self._memory_writer = None
+        self._memory_refiner = None
+        self._dialogue_buffer: list[str] = []  # 缓存最近对话，供 MemoryWriter 使用
+
+        # 感知与策略模块（延迟初始化）
+        self._gap_detector = None
+        self._strategy_engine = None
+        self._current_strategy: dict | None = None  # 当前轮的策略结果
+
+    @property
+    def memory_awaker(self):
+        if self._memory_awaker is None:
+            from core.memory_awakener import MemoryAwakener
+            self._memory_awaker = MemoryAwakener
+        return self._memory_awaker
+
+    @property
+    def memory_writer(self):
+        if self._memory_writer is None:
+            from core.memory_writer import MemoryWriter
+            self._memory_writer = MemoryWriter(
+                llm_chat_fn=self.llm.chat_stateless
+            )
+        return self._memory_writer
+
+    @property
+    def memory_refiner(self):
+        if self._memory_refiner is None:
+            from core.memory_refiner import MemoryRefiner
+            self._memory_refiner = MemoryRefiner(
+                llm_chat_fn=self.llm.chat_stateless
+            )
+        return self._memory_refiner
+
+    @property
+    def gap_detector(self):
+        if self._gap_detector is None:
+            from core.gap_detector import GapDetector
+            self._gap_detector = GapDetector(
+                llm_chat_fn=self.llm.chat_stateless
+            )
+        return self._gap_detector
+
+    @property
+    def strategy_engine(self):
+        if self._strategy_engine is None:
+            from core.strategy_engine import StrategyEngine
+            self._strategy_engine = StrategyEngine(self.gap_detector)
+        return self._strategy_engine
+
     # ── 钩子方法（子类可重写） ──
 
-    def _build_system_prompt(self) -> str:
-        """构建系统提示词。接入 Echo 角色/记忆系统只需重写此方法。"""
+    def _build_system_prompt(self, user_message: str = "", prosody_modifier: float = 0.0) -> str:
+        """构建系统提示词。从记忆系统加载动态上下文并注入角色设定。
+
+        Args:
+            user_message: 用户当前消息，用于策略引擎决策
+            prosody_modifier: 韵律分析修正因子（Phase 4）
+        """
         override = self.config.get("echo_system_prompt")
         if override:
             return override
-        return self.DEFAULT_SYSTEM_PROMPT
+
+        # 尝试加载记忆上下文
+        memory_context = ""
+        try:
+            ctx = self.memory_awaker.build_context()
+            memory_context = ctx.get("full_context", "")
+        except Exception as e:
+            print(f"[Echo] 记忆上下文加载失败，使用基础提示词: {e}", file=sys.stderr)
+
+        if not memory_context:
+            memory_context = "【时间】这是你们第一次对话。\n【你了解的他】你还在认识他。"
+
+        # 策略引擎决策（含韵律修正）
+        mode_block = ""
+        if user_message:
+            try:
+                # 将韵律修正因子传递到 gap detector
+                strategy = self.strategy_engine.decide(user_message, prosody_modifier)
+                self._current_strategy = strategy
+                mode_block = f"\n\n{strategy['mode_prompt']}"
+                if strategy["gap_result"]["gap_detected"]:
+                    voic = f" 语音+" if prosody_modifier > 0.2 else ""
+                    print(f"  🔍 缝隙检测{voic}: gap={strategy['gap_result']['gap_size']:.1f}, "
+                          f"模式={strategy['mode']}"
+                          f"{' (LLM)' if strategy['gap_result'].get('analysis_used_llm') else ''}",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"[Echo] 策略引擎异常: {e}", file=sys.stderr)
+                self._current_strategy = None
+
+        return self.ECHO_BASE_PROMPT.format(memory_context=memory_context) + mode_block
 
     def _on_state_change(self, old: LoopState, new: LoopState):
         """状态变更回调（子类可用于日志/UI 通知）。"""
@@ -389,6 +553,19 @@ class EchoVoiceLoop:
         print("  Echo Voice Loop 已启动")
         print("  直接说话即可，Ctrl+C 退出")
         print("=" * 50)
+
+        # 显示记忆状态
+        try:
+            time_ctx = self.memory_awaker.time_since_last()
+            print(f"  {time_ctx}")
+            from db.database import get_db
+            db = get_db()
+            event_count = db.execute("SELECT COUNT(*) FROM event_memory").fetchone()[0]
+            moment_count = db.execute("SELECT COUNT(*) FROM relationship_moments").fetchone()[0]
+            print(f"  记忆: {event_count} 事件 | {moment_count} 重要时刻")
+        except Exception:
+            pass
+
         self._set_state(LoopState.IDLE)
 
         try:
@@ -404,8 +581,13 @@ class EchoVoiceLoop:
 
         # ── 2. 录音 ──
         self._set_state(LoopState.LISTENING)
+        pcm_bytes = None
         try:
-            wav_bytes = self.recorder.record()
+            result = self.recorder.record(return_pcm=True)
+            if isinstance(result, tuple):
+                wav_bytes, pcm_bytes = result
+            else:
+                wav_bytes = result
         except Exception as e:
             self._set_state(LoopState.ERROR)
             print(f"[错误] 录音失败: {e}", file=sys.stderr)
@@ -413,8 +595,28 @@ class EchoVoiceLoop:
             return
 
         if wav_bytes is None:
-            # 录音太短或无声，静默回到 IDLE
             return
+
+        # ── 2.5 韵律分析（与 STT 并行可做，此处先串行，< 50ms）──
+        prosody_modifier = 0.0
+        if pcm_bytes:
+            try:
+                from voice.prosody_analyzer import ProsodyAnalyzer, prosody_to_gap_modifier
+                _prosody = ProsodyAnalyzer(
+                    baseline=getattr(self, '_prosody_baseline', None) or {},
+                    sample_rate=self.config.get("sample_rate", 16000),
+                )
+                features = _prosody.analyze(pcm_bytes)
+                comparison = _prosody.compare_to_baseline(features)
+                prosody_modifier = prosody_to_gap_modifier(features, comparison)
+                # 更新基线
+                _prosody.update_baseline(features)
+                self._prosody_baseline = _prosody.baseline
+                if prosody_modifier > 0.2:
+                    devs = comparison.get("deviations", {})
+                    print(f"  🎵 韵律异常: modifier={prosody_modifier:.2f} {list(devs.keys())}", file=sys.stderr)
+            except Exception as e:
+                pass  # 韵律分析失败不影响主链路
 
         # ── 3. STT + LLM ──
         self._set_state(LoopState.PROCESSING)
@@ -432,7 +634,7 @@ class EchoVoiceLoop:
         self._on_speech_recognized(user_text)
 
         try:
-            system_prompt = self._build_system_prompt()
+            system_prompt = self._build_system_prompt(user_text, prosody_modifier)
             reply = self.llm.chat(user_text, system_prompt)
         except Exception as e:
             self._set_state(LoopState.ERROR)
@@ -441,6 +643,31 @@ class EchoVoiceLoop:
 
         self._on_response(reply)
 
+        # ── 3.5 记忆提炼（后台异步，不阻塞对话） ──
+        self._dialogue_buffer.append(f"用户: {user_text}")
+        self._dialogue_buffer.append(f"Echo: {reply}")
+        try:
+            threading.Thread(
+                target=self._write_memory,
+                args=(list(self._dialogue_buffer),),
+                daemon=True,
+            ).start()
+            # 限制缓冲区大小
+            if len(self._dialogue_buffer) > 20:
+                self._dialogue_buffer = self._dialogue_buffer[-20:]
+        except Exception:
+            pass  # 记忆写入失败不影响对话
+
+        # ── 3.6 定期深度提炼（后台异步） ──
+        try:
+            if self.memory_refiner.should_refine():
+                threading.Thread(
+                    target=self._run_refiner,
+                    daemon=True,
+                ).start()
+        except Exception:
+            pass
+
         # ── 4. TTS 播放 ──
         self._set_state(LoopState.SPEAKING)
         try:
@@ -448,6 +675,40 @@ class EchoVoiceLoop:
         except Exception as e:
             self._set_state(LoopState.ERROR)
             print(f"[错误] TTS 播放失败: {e}", file=sys.stderr)
+
+    def _write_memory(self, dialogue_turns: list[str]):
+        """后台写入记忆。"""
+        try:
+            result = self.memory_writer.write(dialogue_turns, session_id=self.session_id)
+            events_count = len(result.get("events_written", []))
+            signals_count = result.get("signals_collected", 0)
+            if events_count > 0 or signals_count > 0:
+                parts = [f"  📝 记忆: {events_count} 事件"]
+                if signals_count > 0:
+                    parts.append(f"{signals_count} 信号")
+                if result.get("moment_created"):
+                    parts.append("💎 重要时刻")
+                print(" | ".join(parts), file=sys.stderr)
+        except Exception as e:
+            print(f"\n  ⚠ 记忆写入失败: {e}", file=sys.stderr)
+
+    def _run_refiner(self):
+        """后台执行深度记忆提炼 + 信号衰减 + Echo 自省。"""
+        try:
+            result = self.memory_refiner.refine()
+            if result.get("refined"):
+                updates = result.get("model_layers_updated", [])
+                notes = result.get("consolidation", "")
+                parts = [f"  🔄 深度提炼 (第{self.memory_refiner.refine_count}次): {', '.join(updates)}"]
+                if result.get("signals_decayed"):
+                    parts.append("信号已衰减")
+                if result.get("weekly_reflection"):
+                    parts.append("💭 Echo 自省已记录")
+                print("\n" + " | ".join(parts), file=sys.stderr)
+                if notes:
+                    print(f"  💡 {notes}", file=sys.stderr)
+        except Exception as e:
+            print(f"\n  ⚠ 记忆提炼失败: {e}", file=sys.stderr)
 
     def _set_state(self, new_state: LoopState):
         old = self.state
@@ -473,30 +734,21 @@ class EchoVoiceLoop:
 
 class EchoVoiceLoopExtended(EchoVoiceLoop):
     """对接 Echo 伴侣系统的扩展子类。
-    只需重写 _build_system_prompt 和 _loop_once 两个方法。
+
+    已集成：
+    - Memory Awakener：对话前从 SQLite 加载记忆上下文
+    - Memory Writer：对话后自动提炼记忆写入数据库
+    - Memory Refiner：每 N 轮对话自动深度提炼用户模型
+
+    待集成（Phase 3-4）：
+    - 唤醒词检测（openWakeWord）
+    - 缝隙感知（Gap Detector）
+    - 策略引擎（Strategy Engine）
     """
-
-    def _build_system_prompt(self) -> str:
-        """从 Echo 角色系统获取提示词。"""
-        # 从 Echo 的 memory.js 逻辑映射到 Python 端：
-        # 1. 加载 Echo 角色定义
-        # 2. 注入 spaced-repetition 记忆引擎的内容
-        # 3. 注入今日推荐（getDailyPick）
-
-        base_prompt = self.DEFAULT_SYSTEM_PROMPT
-
-        # 如果安装了 echo.character 模块
-        try:
-            from echo.character import get_system_prompt
-            base_prompt = get_system_prompt()
-        except ImportError:
-            pass
-
-        return base_prompt
 
     def _loop_once(self):
         """可在此加入唤醒词检测。"""
-        # 示例：等待唤醒词（可选）
+        # 预留：唤醒词检测
         # if not self._wait_for_wakeword():
         #     time.sleep(0.1)
         #     return
@@ -505,7 +757,7 @@ class EchoVoiceLoopExtended(EchoVoiceLoop):
     # 预留：唤醒词检测
     def _wait_for_wakeword(self) -> bool:
         """检测唤醒词（可选扩展）。默认始终返回 True。"""
-        # 可接入 openWakeWord 或 Porcupine
+        # Phase 4 接入 openWakeWord 或 Porcupine
         return True
 
 
